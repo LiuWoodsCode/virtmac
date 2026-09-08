@@ -1,2 +1,4 @@
 avm
 .DS_Store
+./VMs
+*.ipsw
