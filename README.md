@@ -1,12 +1,14 @@
 # avm
 
-A simple headless macOS VM client for Apple Silicon, supporting **hardware video encoding** (H.264, HEVC, ProRes) via paravirtualized VideoToolbox.
+A native macOS VM manager for Apple Silicon with a SwiftUI library and a full command-line interface. It supports **hardware video encoding** (H.264, HEVC, ProRes) via paravirtualized VideoToolbox.
 
 ## Quick Start
 
 ```bash
 # Build
-swiftc -O -framework Virtualization -framework AppKit avm.swift -o avm
+swiftc -O -parse-as-library \
+  -framework Virtualization -framework AppKit -framework SwiftUI -framework IOKit \
+  avm.swift avm_swiftui.swift -o avm
 codesign --force --sign - --entitlements avm.entitlements avm
 
 # For hardware video encoding: relax SIP (one-time, from Recovery)
@@ -14,7 +16,10 @@ codesign --force --sign - --entitlements avm.entitlements avm
 # csrutil enable --without debug
 # brew install retX0/tap/amfree && sudo amfree --path /path/to/avm/
 
-# Create a VM (downloads the latest macOS IPSW automatically)
+# Open the VM library (reads ~/VMs/)
+./avm
+
+# Or create a VM from the command line (downloads the latest macOS IPSW automatically)
 ./avm install latest ~/VMs/dev.vbvm --cpus 6 --memory 8 --disk 128
 
 # Or use an existing IPSW
@@ -27,9 +32,20 @@ codesign --force --sign - --entitlements avm.entitlements avm
 ## Usage
 
 ```
+avm                                      Open the SwiftUI VM library
 avm <path.vbvm>                          Run an existing VM
 avm install <ipsw|latest> <path.vbvm>    Create and install a new VM
 ```
+
+## VM Library
+
+Running `avm` without arguments opens the native VM library. It discovers `.vbvm`
+bundles in `~/VMs/`, shows their saved CPU, memory, display, and network settings,
+and can start a VM normally or in macOS Recovery. New VMs can be created with the
+latest supported macOS restore image or a local IPSW.
+
+The GUI is a presentation layer over the same `VMRuntime`, configuration builder,
+and `installVM` service used by the command-line interface.
 
 ### Options
 

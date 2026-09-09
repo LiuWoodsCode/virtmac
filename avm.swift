@@ -1,4 +1,4 @@
-import Cocoa
+import Foundation
 import Virtualization
 import IOKit
 import IOKit.usb
@@ -433,62 +433,81 @@ func buildInstallVMConfig(hardwareModel: VZMacHardwareModel, machineId: VZMacMac
 
 // MARK: - Install
 
-func resolveIPSW(_ path: String, near bundlePath: String) -> URL {
+enum InstallProgress {
+    case message(String)
+    case download(Double)
+    case restore(Double)
+}
+
+struct AVMError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+func resolveIPSW(_ path: String, near bundlePath: String,
+                 progress: @escaping (InstallProgress) -> Void = { _ in }) throws -> URL {
     if path != "latest" {
         let url = URL(fileURLWithPath: path)
-        guard FileManager.default.fileExists(atPath: url.path) else { die("IPSW not found at '\(path)'") }
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw AVMError(message: "IPSW not found at '\(path)'")
+        }
         return url
     }
 
-    log("Fetching latest supported IPSW info...")
-    let image: VZMacOSRestoreImage = try! waitFor { cb in VZMacOSRestoreImage.fetchLatestSupported { cb($0) } }
+    progress(.message("Fetching the latest supported restore image…"))
+    let image: VZMacOSRestoreImage = try waitFor { cb in VZMacOSRestoreImage.fetchLatestSupported { cb($0) } }
     let dest  = URL(fileURLWithPath: bundlePath).deletingLastPathComponent().appendingPathComponent(image.url.lastPathComponent)
 
     if FileManager.default.fileExists(atPath: dest.path) {
-        log("IPSW already downloaded: \(dest.path)")
+        progress(.message("Using \(dest.lastPathComponent)"))
         return dest
     }
 
-    log("Downloading: \(image.url)")
+    progress(.message("Downloading \(image.url.lastPathComponent)…"))
+    let semaphore = DispatchSemaphore(value: 0)
+    var downloadError: Error?
     let task = URLSession.shared.downloadTask(with: image.url) { tmp, _, err in
-        if let err { die("Download failed: \(err.localizedDescription)") }
-        try! FileManager.default.moveItem(at: tmp!, to: dest)
+        do {
+            if let err { throw err }
+            guard let tmp else {
+                throw AVMError(message: "The restore image download did not produce a file")
+            }
+            try FileManager.default.moveItem(at: tmp, to: dest)
+        } catch {
+            downloadError = error
+        }
+        semaphore.signal()
     }
     task.resume()
-    var lastPct = -1
-    while task.state == URLSessionTask.State.running {
-        RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 1.0))
+    while semaphore.wait(timeout: .now() + 0.25) == .timedOut {
+        RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
         let recv = task.countOfBytesReceived, total = task.countOfBytesExpectedToReceive
-        if total > 0 {
-            let pct = Int(recv * 100 / total)
-            if pct != lastPct {
-                fputs("\r  \(pct)%  \(String(format: "%.1f/%.1f GB", Double(recv) / 1e9, Double(total) / 1e9))   ", stderr)
-                lastPct = pct
-            }
-        }
+        if total > 0 { progress(.download(Double(recv) / Double(total))) }
     }
-    fputs("\n", stderr)
-    log("Download complete.")
+    if let downloadError { throw downloadError }
+    progress(.download(1))
     return dest
 }
 
-func install(ipswPath: String, bundlePath: String, config: VMConfig) {
+func installVM(ipswPath: String, bundlePath: String, config: VMConfig,
+               progress: @escaping (InstallProgress) -> Void = { _ in }) throws {
     let fm = FileManager.default
     guard !fm.fileExists(atPath: bundlePath) else {
-        die("'\(bundlePath)' already exists. Remove it first or choose a different path.")
+        throw AVMError(message: "'\(bundlePath)' already exists. Choose a different name.")
     }
 
     // Resolve IPSW (download if "latest")
-    let ipswURL = resolveIPSW(ipswPath, near: bundlePath)
+    let ipswURL = try resolveIPSW(ipswPath, near: bundlePath, progress: progress)
 
     // Load restore image metadata
-    log("Loading IPSW: \(ipswURL.lastPathComponent)")
-    let image: VZMacOSRestoreImage = try! waitFor { cb in VZMacOSRestoreImage.load(from: ipswURL) { cb($0) } }
-    guard let reqs = image.mostFeaturefulSupportedConfiguration else { die("IPSW not supported on this host") }
+    progress(.message("Loading \(ipswURL.lastPathComponent)…"))
+    let image: VZMacOSRestoreImage = try waitFor { cb in VZMacOSRestoreImage.load(from: ipswURL) { cb($0) } }
+    guard let reqs = image.mostFeaturefulSupportedConfiguration else {
+        throw AVMError(message: "This restore image is not supported on this host")
+    }
 
     let hwModel = reqs.hardwareModel
-    log("  Build: \(image.buildVersion)")
-    log("  Min CPUs: \(reqs.minimumSupportedCPUCount), Min RAM: \(reqs.minimumSupportedMemorySize / GB) GB")
+    progress(.message("Preparing macOS build \(image.buildVersion)…"))
 
     // Clamp config to IPSW minimums
     var cfg = config
@@ -498,26 +517,28 @@ func install(ipswPath: String, bundlePath: String, config: VMConfig) {
 
     // Create bundle directory and contents
     let bundle = VMBundle(url: URL(fileURLWithPath: bundlePath))
-    try! fm.createDirectory(at: bundle.url, withIntermediateDirectories: true)
-    try! hwModel.dataRepresentation.write(to: bundle.hardwareModel)
+    try fm.createDirectory(at: bundle.url, withIntermediateDirectories: true)
+    try hwModel.dataRepresentation.write(to: bundle.hardwareModel)
     let mid = VZMacMachineIdentifier()
-    try! mid.dataRepresentation.write(to: bundle.machineId)
-    let aux = try! VZMacAuxiliaryStorage(creatingStorageAt: bundle.auxStorage, hardwareModel: hwModel, options: [.allowOverwrite])
-    fm.createFile(atPath: bundle.disk.path, contents: nil)
-    try! FileHandle(forWritingTo: bundle.disk).apply { try $0.truncate(atOffset: UInt64(cfg.diskGB) * GB); try $0.close() }
-    try! cfg.save(to: bundle.configJSON)
-
-    log("  Created bundle: \(bundlePath)")
-    log("  CPUs: \(cfg.cpus), RAM: \(cfg.memoryGB) GB, Disk: \(cfg.diskGB) GB")
+    try mid.dataRepresentation.write(to: bundle.machineId)
+    let aux = try VZMacAuxiliaryStorage(creatingStorageAt: bundle.auxStorage, hardwareModel: hwModel, options: [.allowOverwrite])
+    guard fm.createFile(atPath: bundle.disk.path, contents: nil) else {
+        throw AVMError(message: "Could not create the virtual disk")
+    }
+    try FileHandle(forWritingTo: bundle.disk).apply {
+        try $0.truncate(atOffset: UInt64(cfg.diskGB) * GB)
+        try $0.close()
+    }
+    try cfg.save(to: bundle.configJSON)
 
     // Build VM config and install
-    let vmConfig = try! buildInstallVMConfig(hardwareModel: hwModel, machineId: mid, auxStorage: aux, diskURL: bundle.disk, config: cfg)
+    let vmConfig = try buildInstallVMConfig(hardwareModel: hwModel, machineId: mid, auxStorage: aux, diskURL: bundle.disk, config: cfg)
     let vm = VZVirtualMachine(configuration: vmConfig)
 
-    log("Installing macOS (this will take a while)...")
+    progress(.message("Installing macOS…"))
     let installer = VZMacOSInstaller(virtualMachine: vm, restoringFromImageAt: ipswURL)
     let obs = installer.progress.observe(\.fractionCompleted, options: []) { (p: Progress, _) in
-        fputs("\r  Install progress: \(Int(p.fractionCompleted * 100))%    ", stderr)
+        progress(.restore(p.fractionCompleted))
     }
 
     let sem = DispatchSemaphore(value: 0)
@@ -527,178 +548,123 @@ func install(ipswPath: String, bundlePath: String, config: VMConfig) {
         sem.signal()
     }
     while sem.wait(timeout: .now()) == .timedOut { RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.5)) }
-    _ = obs; fputs("\n", stderr)
+    _ = obs
 
     if let e = installErr {
         let ns = e as NSError
-        log("  Domain: \(ns.domain), Code: \(ns.code)")
         if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
-            log("  Underlying: \(underlying.domain) \(underlying.code) - \(underlying.localizedDescription)")
+            throw AVMError(message: "\(e.localizedDescription): \(underlying.localizedDescription)")
         }
-        die("Install failed: \(e.localizedDescription)")
+        throw e
     }
-    log("macOS installed successfully!")
-    log("Run with:  avm \(bundlePath)")
-    exit(0)
+    progress(.restore(1))
+    progress(.message("macOS installed successfully"))
 }
 
 // MARK: - Run
 
-class VMDelegate: NSObject, VZVirtualMachineDelegate {
-    func virtualMachine(_ vm: VZVirtualMachine, didStopWithError error: Error) { log("VM stopped: \(error.localizedDescription)"); exit(1) }
-    func guestDidStop(_ vm: VZVirtualMachine) { log("Guest shut down."); exit(0) }
-}
+final class VMRuntime: NSObject, VZVirtualMachineDelegate {
+    let bundle: VMBundle
+    let config: VMConfig
+    let virtualMachine: VZVirtualMachine
+    var onStop: ((Error?) -> Void)?
 
-class VMWindow: NSObject, NSWindowDelegate {
-    let window: NSWindow
-    let view: VZVirtualMachineView
-
-    init(vm: VZVirtualMachine, title: String, width: Int, height: Int) {
-        view = VZVirtualMachineView()
-        view.virtualMachine = vm
-        view.capturesSystemKeys = true
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: CGFloat(width) / 2, height: CGFloat(height) / 2),
-                          styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = title
-        window.contentView = view
-        window.contentMinSize = NSSize(width: 640, height: 480)
+    init(bundle: VMBundle, config: VMConfig) throws {
+        self.bundle = bundle
+        self.config = config
+        virtualMachine = VZVirtualMachine(configuration: try buildVMConfig(bundle: bundle, config: config))
         super.init()
-        window.delegate = self
-        window.center()
-        window.makeKeyAndOrderFront(nil)
+        virtualMachine.delegate = self
     }
 
-    func windowWillClose(_ n: Notification) { exit(0) }
-}
-
-class AppDelegate: NSObject, NSApplicationDelegate {
-    let bundle: VMBundle, config: VMConfig, headless: Bool, recovery: Bool
-    var delegate: VMDelegate?
-    var window: VMWindow?
-
-    init(bundle: VMBundle, config: VMConfig, headless: Bool, recovery: Bool) {
-        self.bundle = bundle; self.config = config; self.headless = headless; self.recovery = recovery
+    func start(recovery: Bool, completion: @escaping (Error?) -> Void) {
+        let started: (Error?) -> Void = { [weak self] error in
+            if error == nil { self?.captureUSBDevices() }
+            completion(error)
+        }
+        if recovery {
+            let options = VZMacOSVirtualMachineStartOptions()
+            options.startUpFromMacOSRecovery = true
+            virtualMachine.start(options: options, completionHandler: started)
+        } else {
+            virtualMachine.start { result in
+                switch result {
+                case .success: started(nil)
+                case .failure(let error): started(error)
+                }
+            }
+        }
     }
 
-    func applicationDidFinishLaunching(_ n: Notification) {
+    func requestStop(completion: @escaping (Error?) -> Void) {
         do {
-            log("VM: \(bundle.name)")
-            log("  CPUs: \(config.cpus), RAM: \(config.memoryGB) GB")
-            log("  Display: \(config.width)x\(config.height) @ \(config.ppi) PPI")
-            log("  Mode: \(headless ? "headless" : "GUI")\(recovery ? " (recovery)" : "")")
-
-            let vmConfig = try buildVMConfig(bundle: bundle, config: config)
-            let vm = VZVirtualMachine(configuration: vmConfig)
-            delegate = VMDelegate(); vm.delegate = delegate
-
-            if headless {
-                // Attach a VZVirtualMachineView even in headless mode -- without it,
-                // Virtualization.framework doesn't create the NAT bridge (bridge100)
-                let view = VZVirtualMachineView()
-                view.virtualMachine = vm
-                objc_setAssociatedObject(vm, "headlessView", view, .OBJC_ASSOCIATION_RETAIN)
-            } else {
-                window = VMWindow(vm: vm, title: bundle.name, width: config.width, height: config.height)
-            }
-
-            log("Starting...")
-            if recovery {
-                let opts = VZMacOSVirtualMachineStartOptions(); opts.startUpFromMacOSRecovery = true
-                vm.start(options: opts) { [self] err in
-                    if let e = err { die("Failed to start: \(e.localizedDescription)") }
-                    log("VM running (recovery).")
-                    self.captureUSBDevices(from: vm)
-                }
-            } else {
-                vm.start { [self] r in
-                    if case .failure(let e) = r { die("Failed to start: \(e.localizedDescription)") }
-                    log("VM running.")
-                    self.captureUSBDevices(from: vm)
-                }
-            }
-        } catch { die(error.localizedDescription) }
+            try virtualMachine.requestStop()
+            completion(nil)
+        } catch {
+            completion(error)
+        }
     }
 
-    func captureUSBDevices(from vm: VZVirtualMachine) {
+    func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
+        onStop?(error)
+    }
+
+    func guestDidStop(_ virtualMachine: VZVirtualMachine) {
+        onStop?(nil)
+    }
+
+    private func captureUSBDevices() {
         guard !config.usbDevices.isEmpty else { return }
-        guard let controller = vm.usbControllers.first else {
+        guard let controller = virtualMachine.usbControllers.first else {
             log("  USB: no XHCI controller on running VM")
             return
         }
 
-        // Build passthrough configs and create runtime devices, then attach + capture.
         let usbConfigs = buildUSBPassthroughConfigs(config.usbDevices)
-        guard !usbConfigs.isEmpty else {
-            log("  USB: no valid passthrough configs")
+        guard !usbConfigs.isEmpty,
+              let deviceClass = NSClassFromString("_VZIOUSBHostPassthroughDevice") as? NSObject.Type else {
+            log("  USB: no passthrough devices available")
             return
         }
 
-        // Create runtime _VZIOUSBHostPassthroughDevice from each config
-        guard let devCls = NSClassFromString("_VZIOUSBHostPassthroughDevice") as? NSObject.Type else {
-            log("  USB: _VZIOUSBHostPassthroughDevice not available")
+        let initializer = NSSelectorFromString("initWithConfiguration:error:")
+        guard deviceClass.instancesRespond(to: initializer),
+              let implementation = deviceClass.instanceMethod(for: initializer) else {
+            log("  USB: runtime device initializer not available")
             return
         }
-
-        let initSel = NSSelectorFromString("initWithConfiguration:error:")
-        guard devCls.instancesRespond(to: initSel) else {
-            log("  USB: initWithConfiguration:error: not available")
-            return
-        }
-
         typealias InitMethod = @convention(c) (AnyObject, Selector, AnyObject, UnsafeMutablePointer<NSError?>) -> AnyObject?
-        let initImp = devCls.instanceMethod(for: initSel)!
-        let initFn = unsafeBitCast(initImp, to: InitMethod.self)
+        let initialize = unsafeBitCast(implementation, to: InitMethod.self)
 
-        var devices: [NSObject] = []
-        for cfg in usbConfigs {
-            let obj = devCls.init()
-            var err: NSError?
-            if let dev = initFn(obj, initSel, cfg, &err) as? NSObject {
-                devices.append(dev)
-                log("  USB: device created from config")
-            } else {
-                log("  USB: device init failed: \(err?.localizedDescription ?? "unknown")")
-            }
+        let devices: [NSObject] = usbConfigs.compactMap { configuration in
+            let object = deviceClass.init()
+            var error: NSError?
+            let device = initialize(object, initializer, configuration, &error) as? NSObject
+            if let error { log("  USB: device init failed: \(error.localizedDescription)") }
+            return device
         }
 
-        guard !devices.isEmpty else {
-            log("  USB: no runtime devices created")
-            return
-        }
-
-        // Attach each device to the XHCI controller, then capture
         let group = DispatchGroup()
-        for dev in devices {
+        for device in devices {
             group.enter()
-            controller.attach(device: dev as! VZUSBDevice) { error in
-                if let e = error {
-                    log("  USB: attach failed: \(e.localizedDescription)")
-                } else {
-                    log("  USB: device attached")
-                }
+            controller.attach(device: device as! VZUSBDevice) { error in
+                if let error { log("  USB: attach failed: \(error.localizedDescription)") }
                 group.leave()
             }
         }
 
         group.notify(queue: .main) {
-            // After all devices attached, capture passthrough devices from host
-            let captureSel = NSSelectorFromString("_capturePassthroughDevicesWithCompletionHandler:")
-            guard (controller as NSObject).responds(to: captureSel) else {
-                log("  USB: _capturePassthroughDevices not available")
+            let selector = NSSelectorFromString("_capturePassthroughDevicesWithCompletionHandler:")
+            guard (controller as NSObject).responds(to: selector) else {
+                log("  USB: capture API not available")
                 return
             }
-
-            // Note: type encoding shows ^v (raw pointer) for the handler parameter,
-            // but ObjC runtime accepts blocks as void* transparently.
             typealias CaptureMethod = @convention(c) (AnyObject, Selector, @escaping @convention(block) (NSError?) -> Void) -> Void
-            let imp = (controller as NSObject).method(for: captureSel)
-            let fn = unsafeBitCast(imp, to: CaptureMethod.self)
-            fn(controller, captureSel) { error in
-                if let e = error {
-                    log("  USB: capture failed: \(e.localizedDescription)")
-                } else {
-                    log("  USB: passthrough devices captured from host")
-                }
+            let implementation = (controller as NSObject).method(for: selector)
+            let capture = unsafeBitCast(implementation, to: CaptureMethod.self)
+            capture(controller, selector) { error in
+                if let error { log("  USB: capture failed: \(error.localizedDescription)") }
+                else { log("  USB: passthrough devices captured from host") }
             }
         }
     }
@@ -710,6 +676,7 @@ let usage = """
 avm - macOS VM manager using Virtualization.framework
 
 USAGE:
+  avm                                      Open the VM library
   avm <path.vbvm>                          Run an existing VM
   avm install <ipsw|latest> <path.vbvm>    Create and install a new VM
 
@@ -731,7 +698,8 @@ EXAMPLES:
   avm --headless --recovery ~/VMs/dev.vbvm
 """
 
-var args = Array(CommandLine.arguments.dropFirst())
+func runCommandLine(arguments: [String]) {
+var args = arguments
 if args.isEmpty || args.contains("-h") || args.contains("--help") { fputs(usage + "\n", stderr); exit(0) }
 
 let isInstall = args.first == "install"
@@ -768,8 +736,21 @@ while i < args.count {
 
 if isInstall {
     guard positional.count == 2 else { die("install needs <ipsw|latest> <bundle-path>") }
-    install(ipswPath: positional[0], bundlePath: positional[1], config: config)
-    dispatchMain()
+    do {
+        try installVM(ipswPath: positional[0], bundlePath: positional[1], config: config) { update in
+            switch update {
+            case .message(let message): log(message)
+            case .download(let fraction):
+                fputs("\r  Download progress: \(Int(fraction * 100))%    ", stderr)
+            case .restore(let fraction):
+                fputs("\r  Install progress: \(Int(fraction * 100))%    ", stderr)
+            }
+        }
+        fputs("\n", stderr)
+        log("macOS installed successfully!")
+    } catch {
+        die(error.localizedDescription)
+    }
 } else {
     guard positional.count == 1 else { die("expected one VM bundle path") }
     let path = positional[0]
@@ -788,14 +769,8 @@ if isInstall {
     if args.contains("--net") { cfg.network = config.network }
     if !config.usbDevices.isEmpty { cfg.usbDevices = config.usbDevices }
 
-    let app = NSApplication.shared
-    let appDelegate = AppDelegate(bundle: bundle, config: cfg, headless: headless, recovery: recovery)
-    app.delegate = appDelegate
-    // .prohibited prevents Virtualization.framework from creating the NAT bridge;
-    // .accessory keeps AppKit alive without showing a Dock icon or menu bar
-    app.setActivationPolicy(headless ? .accessory : .regular)
-    if !headless { app.activate(ignoringOtherApps: true) }
-    app.run()
+    runVirtualMachine(bundle: bundle, config: cfg, headless: headless, recovery: recovery)
+}
 }
 
 // MARK: - Extensions
